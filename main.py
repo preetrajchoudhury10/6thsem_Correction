@@ -10,7 +10,7 @@ from playwright.async_api import async_playwright
 # --- CONFIGURATION START ---
 
 # [!] HARDCODED REGISTRATION NUMBER
-TARGET_REG_NO = "ENTER_YOUR_REG_NO_HERE"  # <--- ENTER YOUR NUMBER HERE
+TARGET_REG_NO = "22156148040"
 
 # [!] SECURE VARIABLES (Loaded from Railway)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -31,15 +31,18 @@ TARGET_SUBJECT = {
 }
 
 # TIMING SETTINGS
-CHECK_INTERVAL = 60       # Check every 1 minute
-NOTIFY_INTERVAL = 18000   # Send "Still Pending" msg every 5 hours
+CHECK_INTERVAL = 60       # Check result every 1 minute
+POLL_INTERVAL = 2         # Check for /ping every 2 seconds
+NOTIFY_INTERVAL = 18000   # "Still Pending" msg every 5 hours
 
 # --- CONFIGURATION END ---
 
 class ResultRepairMonitor:
     def __init__(self):
         self.ist_timezone = pytz.timezone('Asia/Kolkata')
-        self.last_notify_time = 0 
+        self.last_notify_time = 0
+        self.last_update_id = 0
+        self.stop_signal = False # Used to stop the listener when result is found
 
     def get_indian_time(self) -> str:
         utc_now = datetime.now(pytz.utc)
@@ -59,9 +62,7 @@ class ResultRepairMonitor:
         return f"https://beu-bih.ac.in/result-three?{urllib.parse.urlencode(params)}"
 
     async def send_telegram_message(self, text: str):
-        if not BOT_TOKEN or not CHAT_ID:
-            print("❌ Error: Missing Telegram Env Variables")
-            return
+        if not BOT_TOKEN or not CHAT_ID: return
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
         try:
@@ -84,69 +85,43 @@ class ResultRepairMonitor:
         except Exception as e:
             print(f"Photo Upload Error: {e}")
 
-    async def check_for_correction(self):
-        url = self.construct_url()
-        timestamp = self.get_indian_time()
-        print(f"[*] Checking {TARGET_REG_NO} at {timestamp}...")
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            
-            try:
-                await page.goto(url, timeout=60000) 
-                
-                try:
-                    await page.wait_for_selector(f"text={TARGET_REG_NO}", timeout=20000)
-                except:
-                    print("[-] Page load timeout or Result not found.")
-                    await browser.close()
-                    return ("ERROR", None)
-
-                text_content = await page.inner_text("body")
-                
-                target_code = TARGET_SUBJECT['code']
-                target_marks = TARGET_SUBJECT['expected_marks']
-
-                # 1. SUCCESS: Status changed to PASS
-                if "PASS" in text_content and "FAIL" not in text_content:
-                    screenshot = await page.screenshot(full_page=True)
-                    await browser.close()
-                    return ("FIXED", screenshot)
-
-                # 2. SUCCESS: Specific marks visible
-                if target_marks in text_content and target_code in text_content:
-                    screenshot = await page.screenshot(full_page=True)
-                    await browser.close()
-                    return ("FIXED", screenshot)
-
-                # 3. FAILURE: Still showing FAIL
-                if "FAIL" in text_content:
-                    await browser.close()
-                    return ("STILL_BROKEN", None)
-                
-                await browser.close()
-                return ("UNCERTAIN", None)
-
-            except Exception as e:
-                print(f"[-] Browser Error: {e}")
-                await browser.close()
-                return ("ERROR", None)
-
-    async def run(self):
-        # Initial check to ensure user edited the file
-        if "ENTER_YOUR" in TARGET_REG_NO:
-            print("❌ ERROR: You forgot to put your Reg No in main.py!")
-            return
-
-        start_msg = (
-            f"🕵️ <b>Correction Monitor Started (Cloud)</b>\n"
-            f"Target Reg: {TARGET_REG_NO}\n"
-            f"Watching: {TARGET_SUBJECT['code']} for {TARGET_SUBJECT['expected_marks']}\n"
-        )
-        await self.send_telegram_message(start_msg)
+    # --- NEW: LISTENER TASK ---
+    async def listen_for_commands(self):
+        """Constantly checks Telegram for /ping"""
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+        print("[*] Bot Listener Started...")
         
-        while True:
+        async with aiohttp.ClientSession() as session:
+            while not self.stop_signal:
+                try:
+                    params = {"offset": self.last_update_id + 1, "timeout": 10}
+                    async with session.get(url, params=params) as resp:
+                        data = await resp.json()
+                        
+                        if data.get("ok") and data.get("result"):
+                            for update in data["result"]:
+                                self.last_update_id = update["update_id"]
+                                message = update.get("message", {})
+                                text = message.get("text", "").strip()
+                                
+                                # Handle /ping
+                                if text == "/ping":
+                                    timestamp = self.get_indian_time()
+                                    await self.send_telegram_message(f"🏓 <b>Pong!</b>\n\nMonitor is Active 🟢\nTarget: {TARGET_REG_NO}\nTime: {timestamp}")
+                                    print(f"[cmd] /ping received at {timestamp}")
+
+                except Exception as e:
+                    print(f"[!] Polling Error: {e}")
+                    await asyncio.sleep(5) # Backoff on error
+                
+                await asyncio.sleep(POLL_INTERVAL)
+
+    # --- MONITOR TASK (Unchanged Logic) ---
+    async def monitor_loop(self):
+        print(f"[*] Monitor Started for {TARGET_REG_NO}")
+        
+        while not self.stop_signal:
+            # 1. Check the result
             status, evidence = await self.check_for_correction()
             timestamp = self.get_indian_time()
             current_time = time.time()
@@ -161,10 +136,13 @@ class ResultRepairMonitor:
                     await self.send_telegram_photo(evidence, msg)
                 else:
                     await self.send_telegram_message(msg)
-                print("Correction found! Exiting.")
-                break 
+                
+                print("Correction found! Stopping.")
+                self.stop_signal = True # Stops the listener too
+                return
 
             elif status == "STILL_BROKEN":
+                # 5-hour notification
                 if current_time - self.last_notify_time > NOTIFY_INTERVAL:
                     if self.last_notify_time == 0:
                         self.last_notify_time = current_time
@@ -177,7 +155,62 @@ class ResultRepairMonitor:
             elif status == "ERROR":
                 print(f"    [!] Error checking result at {timestamp}")
 
+            # Sleep 60 seconds
             await asyncio.sleep(CHECK_INTERVAL)
+
+    # --- CORE CHECK LOGIC ---
+    async def check_for_correction(self):
+        url = self.construct_url()
+        timestamp = self.get_indian_time()
+        print(f"[*] Checking Result at {timestamp}...")
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            try:
+                await page.goto(url, timeout=60000)
+                try:
+                    await page.wait_for_selector(f"text={TARGET_REG_NO}", timeout=20000)
+                except:
+                    await browser.close()
+                    return ("ERROR", None)
+
+                text_content = await page.inner_text("body")
+                target_code = TARGET_SUBJECT['code']
+                target_marks = TARGET_SUBJECT['expected_marks']
+
+                if "PASS" in text_content and "FAIL" not in text_content:
+                    screenshot = await page.screenshot(full_page=True)
+                    await browser.close()
+                    return ("FIXED", screenshot)
+
+                if target_marks in text_content and target_code in text_content:
+                    screenshot = await page.screenshot(full_page=True)
+                    await browser.close()
+                    return ("FIXED", screenshot)
+
+                if "FAIL" in text_content:
+                    await browser.close()
+                    return ("STILL_BROKEN", None)
+                
+                await browser.close()
+                return ("UNCERTAIN", None)
+            except:
+                await browser.close()
+                return ("ERROR", None)
+
+    async def run(self):
+        if "ENTER_YOUR" in TARGET_REG_NO:
+            print("❌ ERROR: Set TARGET_REG_NO in main.py!")
+            return
+
+        await self.send_telegram_message(f"🕵️ <b>Monitor Started (Cloud)</b>\nTarget: {TARGET_REG_NO}\n<i>Send /ping to check status.</i>")
+        
+        # Run both tasks simultaneously
+        await asyncio.gather(
+            self.monitor_loop(),
+            self.listen_for_commands()
+        )
 
 if __name__ == "__main__":
     asyncio.run(ResultRepairMonitor().run())
