@@ -33,7 +33,7 @@ TARGET_SUBJECT = {
 # TIMING SETTINGS
 CHECK_INTERVAL = 60       # Check result every 1 minute
 POLL_INTERVAL = 2         # Check for /ping every 2 seconds
-NOTIFY_INTERVAL = 18000   # "Still Pending" msg every 5 hours
+NOTIFY_INTERVAL = 21600   # "Still Pending" msg every 6 hours (6 * 60 * 60 = 21600)
 
 # --- CONFIGURATION END ---
 
@@ -116,10 +116,14 @@ class ResultRepairMonitor:
                 
                 await asyncio.sleep(POLL_INTERVAL)
 
-    # --- MONITOR TASK (Unchanged Logic) ---
+    # --- MONITOR TASK ---
     async def monitor_loop(self):
         print(f"[*] Monitor Started for {TARGET_REG_NO}")
         
+        # Initialize last_notify_time to now so the first "Still Pending" msg 
+        # waits for 6 hours (since we send a 'Started' msg on boot).
+        self.last_notify_time = time.time()
+
         while not self.stop_signal:
             # 1. Check the result
             status, evidence = await self.check_for_correction()
@@ -142,15 +146,10 @@ class ResultRepairMonitor:
                 return
 
             elif status == "STILL_BROKEN":
-                # 5-hour notification
+                # Check if 6 hours have passed
                 if current_time - self.last_notify_time > NOTIFY_INTERVAL:
-                    if self.last_notify_time == 0:
-                        self.last_notify_time = current_time
-                    else:
-                        await self.send_telegram_message(f"ℹ️ <b>Status Report:</b>\nStill showing FAIL/NA.\n{timestamp}")
-                        self.last_notify_time = current_time
-                if self.last_notify_time == 0:
-                     self.last_notify_time = current_time
+                    await self.send_telegram_message(f"ℹ️ <b>Status Report:</b>\nResult not yet updated (Still FAIL/NA).\n{timestamp}")
+                    self.last_notify_time = current_time # Reset timer
 
             elif status == "ERROR":
                 print(f"    [!] Error checking result at {timestamp}")
@@ -204,7 +203,7 @@ class ResultRepairMonitor:
             print("❌ ERROR: Set TARGET_REG_NO in main.py!")
             return
 
-        await self.send_telegram_message(f"🕵️ <b>Monitor Started (Cloud)</b>\nTarget: {TARGET_REG_NO}\n<i>Send /ping to check status.</i>")
+        await self.send_telegram_message(f"🕵️ <b>Monitor Started (Cloud)</b>\nTarget: {TARGET_REG_NO}\nChecking every 1 min.\nStatus update every 6 hours.\n<i>Send /ping to check status manually.</i>")
         
         # Run both tasks simultaneously
         await asyncio.gather(
