@@ -30,7 +30,7 @@ TARGET_SUBJECT = {
 
 CHECK_INTERVAL = 600      # Check result every 10 minutes
 POLL_INTERVAL = 2         # Check for commands every 2 seconds
-NOTIFY_INTERVAL = 3600    # 1 Hour Status Report
+NOTIFY_INTERVAL = 21600    # 1 Hour Status Report
 
 # --- CONFIGURATION END ---
 
