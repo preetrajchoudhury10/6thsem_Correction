@@ -42,7 +42,7 @@ class ResultRepairMonitor:
         self.stop_signal = False
         self.browser_lock = asyncio.Lock()
         
-        # THE NEW FEATURE: A memory queue that stores the last 15 log messages
+        # A memory queue that stores the last 15 log messages
         self.log_history = deque(maxlen=15)
 
     def get_indian_time(self) -> str:
@@ -89,7 +89,11 @@ class ResultRepairMonitor:
         data = aiohttp.FormData()
         data.add_field('chat_id', CHAT_ID)
         data.add_field('photo', photo_bytes, filename="result.png", content_type="image/png")
-        data.add_field('caption', caption, parse_mode="HTML")
+        
+        # --- THE FIX: parse_mode is now added as a separate field ---
+        data.add_field('caption', caption)
+        data.add_field('parse_mode', 'HTML')
+        
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, data=data) as resp:
@@ -128,7 +132,6 @@ class ResultRepairMonitor:
                     self.log("Browser closed successfully.")
                     return text_content, screenshot
             except Exception as e:
-                # Catch the exact error why Playwright is failing
                 self.log(f"CRITICAL Playwright Error: {repr(e)}")
                 return None, None
 
@@ -161,7 +164,9 @@ class ResultRepairMonitor:
                                         self.log("Screenshot taken, sending to Telegram...")
                                         caption = f"🟢 <b>Monitor is Active</b>\nTarget: {TARGET_REG_NO}\nTime: {self.get_indian_time()}"
                                         success = await self.send_telegram_photo(screenshot, caption)
-                                        if not success:
+                                        if success:
+                                            self.log("Screenshot sent successfully!")
+                                        else:
                                             await self.send_telegram_message("⚠️ <b>Error:</b> Screenshot taken, but Telegram rejected it. Check /logs.")
                                     else:
                                         self.log("Screenshot failed to generate.")
@@ -173,7 +178,6 @@ class ResultRepairMonitor:
                                     if not self.log_history:
                                         await self.send_telegram_message("📜 No logs available yet.")
                                     else:
-                                        # Format logs into a code block, replacing < and > so Telegram HTML parsing doesn't break
                                         log_text = "\n".join(self.log_history).replace('<', '&lt;').replace('>', '&gt;')
                                         await self.send_telegram_message(f"📜 <b>Recent Internal Logs:</b>\n<pre>{log_text}</pre>")
 
