@@ -9,10 +9,7 @@ from playwright.async_api import async_playwright
 
 # --- CONFIGURATION START ---
 
-# [!] HARDCODED REGISTRATION NUMBER
 TARGET_REG_NO = "22156148040"
-
-# [!] SECURE VARIABLES (Loaded from Railway)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
@@ -24,16 +21,14 @@ EXAM_CONFIG = {
     "held_year": "2025"
 }
 
-# [!] SUBJECT CONFIGURATION
 TARGET_SUBJECT = {
     "code": "156606P",       
     "expected_marks": "68"   
 }
 
-# TIMING SETTINGS
-CHECK_INTERVAL = 600       # Check result every 1 minute
+CHECK_INTERVAL = 600      # Check result every 10 minutes (Highly recommended for cloud)
 POLL_INTERVAL = 2         # Check for /ping every 2 seconds
-NOTIFY_INTERVAL = 3600   # "Still Pending" msg every 6 hours (1 * 60 * 60 = 21600)
+NOTIFY_INTERVAL = 3600    # 1 Hour Status Report
 
 # --- CONFIGURATION END ---
 
@@ -43,6 +38,8 @@ class ResultRepairMonitor:
         self.last_notify_time = time.time()
         self.last_update_id = 0
         self.stop_signal = False
+        # THE FIX: This lock prevents two browsers from opening at the same time and crashing RAM
+        self.browser_lock = asyncio.Lock()
 
     def get_indian_time(self) -> str:
         utc_now = datetime.now(pytz.utc)
@@ -67,47 +64,58 @@ class ResultRepairMonitor:
         payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload) as resp:
-                    return resp.status == 200
+                await session.post(url, json=payload)
         except Exception as e:
-            print(f"Telegram Error: {e}")
+            print(f"Telegram Message Error: {e}")
 
     async def send_telegram_photo(self, photo_bytes, caption):
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
         data = aiohttp.FormData()
         data.add_field('chat_id', CHAT_ID)
-        data.add_field('photo', photo_bytes, filename="result.png")
+        # Explicit content_type helps Telegram process the image
+        data.add_field('photo', photo_bytes, filename="result.png", content_type="image/png")
         data.add_field('caption', caption, parse_mode="HTML")
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, data=data) as resp:
-                    return resp.status == 200
+                    if resp.status != 200:
+                        err = await resp.text()
+                        print(f"Telegram Rejected Image: {err}")
+                        return False
+                    return True
         except Exception as e:
             print(f"Photo Upload Error: {e}")
+            return False
 
-    # --- CORE SCRAPER FUNCTION ---
     async def get_page_data_and_screenshot(self, url):
-        """Helper function to cleanly fetch text and screenshot."""
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
+        # Apply the lock so /ping and background checks patiently wait for each other
+        async with self.browser_lock:
             try:
-                await page.goto(url, timeout=60000)
-                await page.wait_for_selector(f"text={TARGET_REG_NO}", timeout=20000)
-                
-                text_content = await page.inner_text("body")
-                screenshot = await page.screenshot(full_page=True)
-                
-                await browser.close()
-                return text_content, screenshot
+                async with async_playwright() as p:
+                    # THE FIX: Added args to prevent Docker/Railway memory crashes
+                    browser = await p.chromium.launch(
+                        headless=True,
+                        args=['--no-sandbox', '--disable-dev-shm-usage']
+                    )
+                    page = await browser.new_page()
+                    await page.goto(url, timeout=45000)
+                    
+                    # Wait briefly for the Reg No. If the site is slow, just snap a picture of whatever is there.
+                    try:
+                        await page.wait_for_selector(f"text={TARGET_REG_NO}", timeout=10000)
+                    except:
+                        pass
+                    
+                    text_content = await page.inner_text("body")
+                    screenshot = await page.screenshot(full_page=True)
+                    
+                    await browser.close()
+                    return text_content, screenshot
             except Exception as e:
                 print(f"[!] Playwright Error: {e}")
-                await browser.close()
                 return None, None
 
-    # --- LISTENER TASK ---
     async def listen_for_commands(self):
-        """Constantly checks Telegram for /ping"""
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
         print("[*] Bot Listener Started...")
         
@@ -124,19 +132,18 @@ class ResultRepairMonitor:
                                 message = update.get("message", {})
                                 text = message.get("text", "").strip()
                                 
-                                # Handle /ping
                                 if text == "/ping":
                                     timestamp = self.get_indian_time()
                                     await self.send_telegram_message("🏓 <b>Pong!</b>\nFetching current result screenshot. Please wait...")
-                                    print(f"[cmd] /ping received at {timestamp}")
                                     
-                                    # Fetch current screenshot directly
                                     target_url = self.construct_url()
                                     _, screenshot = await self.get_page_data_and_screenshot(target_url)
                                     
                                     if screenshot:
                                         caption = f"🟢 <b>Monitor is Active</b>\nTarget: {TARGET_REG_NO}\nTime: {timestamp}"
-                                        await self.send_telegram_photo(screenshot, caption)
+                                        success = await self.send_telegram_photo(screenshot, caption)
+                                        if not success:
+                                            await self.send_telegram_message("⚠️ <b>Error:</b> The screenshot was taken, but Telegram rejected the file. Check the Railway console logs.")
                                     else:
                                         await self.send_telegram_message(f"⚠️ <b>Error:</b> Monitor is active, but failed to load the website to take a screenshot at {timestamp}.")
 
@@ -146,12 +153,8 @@ class ResultRepairMonitor:
                 
                 await asyncio.sleep(POLL_INTERVAL)
 
-    # --- MONITOR TASK ---
     async def check_for_correction(self):
         url = self.construct_url()
-        timestamp = self.get_indian_time()
-        print(f"[*] Checking Result at {timestamp}...")
-
         text_content, screenshot = await self.get_page_data_and_screenshot(url)
         
         if not text_content:
@@ -187,7 +190,8 @@ class ResultRepairMonitor:
                     f"Status: PASS detected or Marks '{TARGET_SUBJECT['expected_marks']}' found!"
                 )
                 if evidence:
-                    await self.send_telegram_photo(evidence, msg)
+                    success = await self.send_telegram_photo(evidence, msg)
+                    if not success: await self.send_telegram_message(msg)
                 else:
                     await self.send_telegram_message(msg)
                 
@@ -195,8 +199,6 @@ class ResultRepairMonitor:
                 self.stop_signal = True 
                 return
 
-            # THE 6-HOUR FIX: 
-            # Guaranteed heartbeat regardless of website status (Error, Uncertain, or Broken)
             if current_time - self.last_notify_time > NOTIFY_INTERVAL:
                 await self.send_telegram_message(
                     f"ℹ️ <b>Status Report:</b>\nMonitor is running cleanly. Result not yet updated.\nLast check status: {status}\n{timestamp}"
@@ -210,7 +212,7 @@ class ResultRepairMonitor:
             print("❌ ERROR: Set TARGET_REG_NO in main.py!")
             return
 
-        await self.send_telegram_message(f"🕵️ <b>Monitor Started (Cloud)</b>\nTarget: {TARGET_REG_NO}\nChecking every 1 min.\nStatus update every 6 hours.\n<i>Send /ping to check status and get a screenshot manually.</i>")
+        await self.send_telegram_message(f"🕵️ <b>Monitor Started (Cloud Optimized)</b>\nTarget: {TARGET_REG_NO}\nChecking every 10 mins.\nStatus update every 1 hour.\n<i>Send /ping to check status and get a screenshot manually.</i>")
         
         await asyncio.gather(
             self.monitor_loop(),
