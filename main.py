@@ -115,22 +115,25 @@ class ResultRepairMonitor:
                         headless=True,
                         args=['--no-sandbox', '--disable-dev-shm-usage']
                     )
-                    page = await browser.new_page()
-                    self.log("Navigating to URL...")
-                    await page.goto(url, timeout=45000)
-                    
                     try:
-                        await page.wait_for_selector(f"text={TARGET_REG_NO}", timeout=10000)
-                    except:
-                        self.log("RegNo not found immediately, taking screenshot anyway.")
-                    
-                    self.log("Extracting text and taking screenshot...")
-                    text_content = await page.inner_text("body")
-                    screenshot = await page.screenshot(full_page=True)
-                    
-                    await browser.close()
-                    self.log("Browser closed successfully.")
-                    return text_content, screenshot
+                        page = await browser.new_page()
+                        self.log("Navigating to URL...")
+                        await page.goto(url, timeout=45000)
+                        
+                        try:
+                            await page.wait_for_selector(f"text={TARGET_REG_NO}", timeout=10000)
+                        except:
+                            self.log("RegNo not found immediately, taking screenshot anyway.")
+                        
+                        self.log("Extracting text and taking screenshot...")
+                        text_content = await page.inner_text("body")
+                        screenshot = await page.screenshot(full_page=True)
+                        return text_content, screenshot
+                        
+                    finally:
+                        # Ensures the browser closes even if the try block fails
+                        await browser.close()
+                        self.log("Browser closed successfully.")
             except Exception as e:
                 self.log(f"CRITICAL Playwright Error: {repr(e)}")
                 return None, None
@@ -139,9 +142,10 @@ class ResultRepairMonitor:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
         self.log("Bot Listener Started...")
         
-        async with aiohttp.ClientSession() as session:
-            while not self.stop_signal:
-                try:
+        while not self.stop_signal:
+            try:
+                # Creates a new session per check, avoiding stale connection drops
+                async with aiohttp.ClientSession() as session:
                     params = {"offset": self.last_update_id + 1, "timeout": 10}
                     async with session.get(url, params=params) as resp:
                         data = await resp.json()
@@ -181,11 +185,11 @@ class ResultRepairMonitor:
                                         log_text = "\n".join(self.log_history).replace('<', '&lt;').replace('>', '&gt;')
                                         await self.send_telegram_message(f"📜 <b>Recent Internal Logs:</b>\n<pre>{log_text}</pre>")
 
-                except Exception as e:
-                    self.log(f"Polling Error: {e}")
-                    await asyncio.sleep(5) 
-                
-                await asyncio.sleep(POLL_INTERVAL)
+            except Exception as e:
+                self.log(f"Polling Error: {e}")
+                await asyncio.sleep(5) 
+            
+            await asyncio.sleep(POLL_INTERVAL)
 
     async def check_for_correction(self):
         url = self.construct_url()
